@@ -1,0 +1,260 @@
+"""
+examples/demo_type_safety.py
+==============================
+
+This demo shows the core value proposition of Cognitive Packets:
+
+    TYPE ERRORS ARE CAUGHT AT DEFINITION TIME, NOT AT RUNTIME.
+
+We compare two approaches to building a distributed training pipeline:
+
+    Approach A: Naive torch — errors surface during training, deep in the stack
+    Approach B: Cognitive Packets — errors surface at pipeline definition
+
+We demonstrate three classes of errors that CP catches early:
+    1. Shape mismatch between pipeline stages
+    2. Device mismatch (cpu vs cuda)
+    3. Semantic mismatch (accidentally composing gradient into activation slot)
+
+Run: python examples/demo_type_safety.py
+"""
+
+import torch
+import torch.nn as nn
+from cognitive_packets import (
+    ActivationType, GradientType, LossType,
+    Morphism, CompositionError, CP,
+    CognitivePacket, Adjunction,
+)
+
+
+def separator(title: str):
+    width = 60
+    print(f"\n{'─' * width}")
+    print(f"  {title}")
+    print(f"{'─' * width}")
+
+
+# ─────────────────────────────────────────────────────────────
+# DEMO 1: Shape Mismatch Caught at Definition Time
+# ─────────────────────────────────────────────────────────────
+
+def demo_shape_mismatch():
+    separator("DEMO 1: Shape Mismatch")
+
+    print("""
+Scenario: A distributed pipeline where Node 1 outputs 64-dim vectors
+but Node 2 expects 128-dim inputs. In naive torch, this fails mid-
+training with a cryptic matrix multiply error. In CP, it fails at
+pipeline definition — before any data is processed.
+""")
+
+    cat = CP()
+
+    # Node 1 outputs shape (-1, 64)
+    node1_output = ActivationType(shape=(-1, 64), tag="node1_output")
+    # Node 2 expects shape (-1, 128)  ← WRONG
+    node2_input  = ActivationType(shape=(-1, 128), tag="node2_input")
+    node2_output = ActivationType(shape=(-1, 10), tag="node2_output")
+
+    layer1 = Morphism(
+        domain=ActivationType(shape=(-1, 256), tag="input"),
+        codomain=node1_output,
+        fn=nn.Linear(256, 64),
+        name="node1_layer",
+    )
+
+    layer2 = Morphism(
+        domain=node2_input,   # expects 128 but gets 64
+        codomain=node2_output,
+        fn=nn.Linear(128, 10),
+        name="node2_layer",
+    )
+
+    print("Attempting to compose node1_layer (→64) with node2_layer (128→)...")
+
+    try:
+        pipeline = cat.sequential([layer1, layer2])
+        print("  ✗ No error raised (this would crash during training!)")
+    except CompositionError as e:
+        print(f"  ✓ CompositionError caught at definition time:")
+        for line in str(e).strip().split("\n"):
+            print(f"      {line}")
+
+    print("""
+Compare: naive torch equivalent would be:
+    output = nn.Linear(256, 64)(x)       # Node 1 — fine
+    output = nn.Linear(128, 10)(output)  # Node 2 — RuntimeError during forward()
+    # Error only surfaces when you actually run data through the pipeline!
+""")
+
+
+# ─────────────────────────────────────────────────────────────
+# DEMO 2: Semantic Type Mismatch — Gradient into Activation Slot
+# ─────────────────────────────────────────────────────────────
+
+def demo_semantic_mismatch():
+    separator("DEMO 2: Semantic Type Mismatch")
+
+    print("""
+Scenario: In a distributed backprop system, Node A sends gradient
+packets and Node B accidentally feeds them into a forward activation
+slot. Numerically the shapes might match — this is a silent bug.
+CP's semantic types catch it.
+""")
+
+    shape = (-1, 128)
+
+    activation_type = ActivationType(shape=shape, tag="hidden_activations")
+    gradient_type   = GradientType(shape=shape,   tag="grad_hidden")
+
+    # A layer that expects activations
+    forward_layer = Morphism(
+        domain=activation_type,
+        codomain=ActivationType(shape=(-1, 64), tag="output"),
+        fn=nn.Linear(128, 64),
+        name="forward_layer",
+    )
+
+    # A gradient packet (same shape as activation — would be invisible to torch!)
+    grad_data = torch.randn(16, 128)
+    grad_packet = CognitivePacket(data=grad_data, type=gradient_type)
+
+    print("Attempting to apply forward_layer (expects ActivationType)")
+    print("to a GradientType packet (same shape, wrong semantics)...")
+
+    try:
+        result = forward_layer(grad_packet)
+        print("  ✗ No error raised — silent semantic bug!")
+    except CompositionError as e:
+        print(f"  ✓ CompositionError caught:")
+        for line in str(e).strip().split("\n"):
+            print(f"      {line}")
+
+    print("""
+In naive torch: both are float32 tensors of shape (16, 128).
+The forward pass runs silently, producing garbage outputs.
+Training loss fluctuates mysteriously. Hours of debugging follow.
+""")
+
+
+# ─────────────────────────────────────────────────────────────
+# DEMO 3: Correct Pipeline — Full Forward + Adjoint Backward
+# ─────────────────────────────────────────────────────────────
+
+def demo_correct_pipeline():
+    separator("DEMO 3: Correct Pipeline with Adjoint Backward")
+
+    print("""
+Scenario: A correctly typed 3-layer MLP with:
+  - Forward pass built from sequential composition
+  - Backward pass automatically derived via the adjunction F ⊣ B
+  - Provenance tracking showing gradient flow path
+""")
+
+    torch.manual_seed(42)
+    cat = CP()
+    adj = Adjunction()
+
+    # Define types
+    T_in  = ActivationType(shape=(-1, 128), tag="input")
+    T_h1  = ActivationType(shape=(-1, 64),  tag="hidden1")
+    T_h2  = ActivationType(shape=(-1, 32),  tag="hidden2")
+    T_out = ActivationType(shape=(-1, 10),  tag="output")
+
+    # Define morphisms
+    f1 = cat.morphism(T_in,  T_h1, nn.Sequential(nn.Linear(128, 64), nn.ReLU()), "layer1")
+    f2 = cat.morphism(T_h1, T_h2, nn.Sequential(nn.Linear(64, 32),  nn.ReLU()), "layer2")
+    f3 = cat.morphism(T_h2, T_out, nn.Linear(32, 10),                           "layer3")
+
+    # Build pipeline — type checked at definition
+    pipeline = cat.sequential([f1, f2, f3])
+    print(f"  Pipeline built: {pipeline}")
+
+    # Run forward pass
+    x = torch.randn(8, 128, requires_grad=True)
+    input_packet = CognitivePacket(data=x, type=T_in, provenance=["data_loader"])
+    output_packet = pipeline(input_packet)
+
+    print(f"\n  Forward pass:")
+    print(f"    Input:  {input_packet}")
+    print(f"    Output: {output_packet}")
+    print(f"    Provenance: {' → '.join(output_packet.provenance)}")
+
+    # Derive backward pass via adjunction
+    backward_f1 = adj.transpose(f1)
+    print(f"\n  Adjunction derived backward pass:")
+    print(f"    B(layer1): {backward_f1}")
+
+    # Verify adjunction holds
+    grad_packet = CognitivePacket(
+        data=torch.randn(1, 64),
+        type=GradientType(shape=(-1, 64), tag="grad_hidden1"),
+    )
+    passed, message = adj.verify_adjunction(f1, input_packet, grad_packet)
+    print(f"\n  Adjunction verification:")
+    for line in message.strip().split("\n"):
+        print(f"    {line}")
+
+    # Verify categorical laws
+    print(f"\n  Categorical law verification:")
+    id_ok = cat.verify_identity_law(f1, input_packet)
+    print(f"    Identity law:       {'✓ PASSED' if id_ok else '✗ FAILED'}")
+
+    assoc_ok = cat.verify_associativity_law(f1, f2, f3, input_packet)
+    print(f"    Associativity law:  {'✓ PASSED' if assoc_ok else '✗ FAILED'}")
+
+
+# ─────────────────────────────────────────────────────────────
+# DEMO 4: Parallel (Monoidal) Composition — Data Parallelism
+# ─────────────────────────────────────────────────────────────
+
+def demo_parallel_composition():
+    separator("DEMO 4: Parallel Composition (f ⊗ f)")
+
+    print("""
+Scenario: The monoidal product f ⊗ g applies two morphisms independently
+to separate parts of a batch. This is the categorical foundation for
+data parallelism — in production, f and g would run on separate GPUs.
+""")
+
+    cat = CP()
+    T_in  = ActivationType(shape=(-1, 128), tag="input")
+    T_out = ActivationType(shape=(-1, 64),  tag="hidden")
+
+    f = cat.morphism(T_in, T_out, nn.Linear(128, 64), "shared_layer")
+    f_parallel = cat.parallel(f, f)
+
+    print(f"  Single morphism:   {f}")
+    print(f"  Parallel product:  {f_parallel}")
+
+    # 32-sample batch: each half goes to one 'worker'
+    batch = torch.randn(32, 128)
+    packet = CognitivePacket(data=batch, type=T_in)
+
+    with torch.no_grad():
+        result = f_parallel(packet)
+
+    print(f"\n  Input batch:   {packet}")
+    print(f"  Output batch:  {result}")
+    print(f"  Shape preserved: {result.data.shape} (32 samples, 64-dim)")
+
+
+# ─────────────────────────────────────────────────────────────
+# Run all demos
+# ─────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("\n" + "═" * 60)
+    print("  Cognitive Packets: Categorical Distributed Backpropagation")
+    print("  Demo Suite")
+    print("═" * 60)
+
+    demo_shape_mismatch()
+    demo_semantic_mismatch()
+    demo_correct_pipeline()
+    demo_parallel_composition()
+
+    print("\n" + "═" * 60)
+    print("  All demos complete.")
+    print("═" * 60 + "\n")
