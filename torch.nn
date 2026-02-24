@@ -1,0 +1,430 @@
+"""
+tests/test_categorical_laws.py
+================================
+
+Unit tests verifying the categorical laws of CP:
+  1. Type safety:    composition fails at definition time for bad types
+  2. Identity law:   id_B ∘ f = f = f ∘ id_A
+  3. Associativity:  (h ∘ g) ∘ f = h ∘ (g ∘ f)
+  4. Adjunction:     forward and backward morphisms are adjoint
+
+Run with: pytest tests/ -v
+"""
+
+import pytest
+import torch
+import torch.nn as nn
+
+from cognitive_packets import (
+    ActivationType,
+    GradientType,
+    LossType,
+    Morphism,
+    CompositionError,
+    CP,
+    CognitivePacket,
+    ForwardFunctor,
+    BackwardFunctor,
+    Adjunction,
+)
+
+
+# ─────────────────────────────────────────────
+# Fixtures
+# ─────────────────────────────────────────────
+
+@pytest.fixture
+def types():
+    """Standard packet types for a 3-layer MLP."""
+    return {
+        "A": ActivationType(shape=(-1, 128), tag="input"),
+        "B": ActivationType(shape=(-1, 64),  tag="hidden"),
+        "C": ActivationType(shape=(-1, 32),  tag="hidden2"),
+        "D": ActivationType(shape=(-1, 10),  tag="output"),
+        "G_A": GradientType(shape=(-1, 128), tag="grad_input"),
+        "G_B": GradientType(shape=(-1, 64),  tag="grad_hidden"),
+        "L":   LossType(tag="cross_entropy"),
+    }
+
+
+@pytest.fixture
+def morphisms(types):
+    """Standard morphisms for a 3-layer MLP."""
+    torch.manual_seed(42)
+    return {
+        "f": Morphism(
+            domain=types["A"],
+            codomain=types["B"],
+            fn=nn.Linear(128, 64),
+            name="layer1",
+        ),
+        "g": Morphism(
+            domain=types["B"],
+            codomain=types["C"],
+            fn=nn.Linear(64, 32),
+            name="layer2",
+        ),
+        "h": Morphism(
+            domain=types["C"],
+            codomain=types["D"],
+            fn=nn.Linear(32, 10),
+            name="layer3",
+        ),
+    }
+
+
+@pytest.fixture
+def sample_packet(types):
+    """A sample activation packet for testing."""
+    torch.manual_seed(0)
+    x = torch.randn(16, 128, requires_grad=True)  # batch=16
+    return CognitivePacket(data=x, type=types["A"])
+
+
+@pytest.fixture
+def sample_gradient(types):
+    """A sample gradient packet for testing."""
+    torch.manual_seed(1)
+    g = torch.randn(1, 128)
+    return CognitivePacket(data=g, type=types["G_A"])
+
+
+@pytest.fixture
+def cat():
+    return CP(name="TestCP")
+
+
+# ─────────────────────────────────────────────
+# 1. Type Safety Tests
+# ─────────────────────────────────────────────
+
+class TestTypeSafety:
+    """
+    The primary value proposition of the categorical framework:
+    type errors are caught at composition time, not at runtime.
+    """
+
+    def test_compatible_composition_succeeds(self, morphisms):
+        """f: A→B and g: B→C compose successfully."""
+        composed = morphisms["g"].compose(morphisms["f"])
+        assert composed.domain == morphisms["f"].domain
+        assert composed.codomain == morphisms["g"].codomain
+
+    def test_incompatible_composition_raises(self, types):
+        """f: A→B and h: C→D (B≠C) raises CompositionError at definition time."""
+        f = Morphism(
+            domain=types["A"],
+            codomain=types["B"],
+            fn=nn.Linear(128, 64),
+            name="layer_A_B",
+        )
+        h = Morphism(
+            domain=types["C"],      # C has shape (-1, 32), not (-1, 64)
+            codomain=types["D"],
+            fn=nn.Linear(32, 10),
+            name="layer_C_D",
+        )
+
+        with pytest.raises(CompositionError) as exc_info:
+            h.compose(f)  # Should fail: f.codomain=B != h.domain=C
+
+        assert "type mismatch" in str(exc_info.value).lower()
+
+    def test_wrong_runtime_type_raises(self, morphisms, types):
+        """Applying a morphism to a wrong-typed packet raises CompositionError."""
+        # morphisms["f"] expects ActivationType(shape=(-1,128))
+        # We give it shape (-1, 64) — wrong!
+        wrong_data = torch.randn(16, 64)
+        wrong_packet = CognitivePacket(data=wrong_data, type=types["B"])
+
+        with pytest.raises(CompositionError):
+            morphisms["f"](wrong_packet)
+
+    def test_composition_error_message_is_informative(self, types):
+        """CompositionError should tell you exactly what went wrong."""
+        f = Morphism(
+            domain=types["A"],
+            codomain=types["B"],
+            fn=nn.Linear(128, 64),
+            name="my_layer",
+        )
+        h = Morphism(
+            domain=types["C"],
+            codomain=types["D"],
+            fn=nn.Linear(32, 10),
+            name="other_layer",
+        )
+
+        try:
+            h.compose(f)
+            assert False, "Should have raised"
+        except CompositionError as e:
+            msg = str(e)
+            assert "my_layer" in msg or "other_layer" in msg
+            assert "domain" in msg.lower() or "codomain" in msg.lower()
+
+    def test_construction_with_wrong_tensor_shape_raises(self, types):
+        """CognitivePacket raises if tensor doesn't match declared type."""
+        wrong_tensor = torch.randn(16, 999)  # shape doesn't match (-1, 128)
+        with pytest.raises(TypeError):
+            CognitivePacket(data=wrong_tensor, type=types["A"])
+
+    def test_then_is_forward_composition(self, morphisms, sample_packet):
+        """morphism.then(other) is equivalent to other.compose(morphism)."""
+        via_then = morphisms["f"].then(morphisms["g"])
+        via_compose = morphisms["g"].compose(morphisms["f"])
+
+        with torch.no_grad():
+            out_then = via_then(sample_packet).data
+            out_compose = via_compose(sample_packet).data
+
+        assert torch.allclose(out_then, out_compose, atol=1e-6)
+
+
+# ─────────────────────────────────────────────
+# 2. Identity Law Tests
+# ─────────────────────────────────────────────
+
+class TestIdentityLaw:
+    """
+    Categorical law: id_B ∘ f = f = f ∘ id_A
+    """
+
+    def test_identity_morphism_is_noop(self, types, sample_packet):
+        """The identity morphism returns its input unchanged."""
+        id_A = Morphism.identity(types["A"])
+        out = id_A(sample_packet)
+        assert torch.allclose(out.data, sample_packet.data)
+
+    def test_left_identity(self, morphisms, sample_packet):
+        """id_B ∘ f = f"""
+        f = morphisms["f"]
+        id_B = Morphism.identity(f.codomain)
+        composed = id_B.compose(f)
+
+        with torch.no_grad():
+            out_f = f(sample_packet).data
+            out_composed = composed(sample_packet).data
+
+        assert torch.allclose(out_f, out_composed, atol=1e-6)
+
+    def test_right_identity(self, morphisms, sample_packet):
+        """f ∘ id_A = f"""
+        f = morphisms["f"]
+        id_A = Morphism.identity(f.domain)
+        composed = f.compose(id_A)
+
+        with torch.no_grad():
+            out_f = f(sample_packet).data
+            out_composed = composed(sample_packet).data
+
+        assert torch.allclose(out_f, out_composed, atol=1e-6)
+
+    def test_cp_verify_identity_law(self, cat, morphisms, sample_packet):
+        """CP.verify_identity_law passes for a standard linear layer."""
+        result = cat.verify_identity_law(morphisms["f"], sample_packet)
+        assert result, "Identity law should hold for linear layers"
+
+
+# ─────────────────────────────────────────────
+# 3. Associativity Law Tests
+# ─────────────────────────────────────────────
+
+class TestAssociativityLaw:
+    """
+    Categorical law: (h ∘ g) ∘ f = h ∘ (g ∘ f)
+    """
+
+    def test_associativity(self, morphisms, sample_packet):
+        """Both bracketings produce the same result."""
+        f, g, h = morphisms["f"], morphisms["g"], morphisms["h"]
+
+        # (h ∘ g) ∘ f
+        hg = h.compose(g)
+        hg_f = hg.compose(f)
+
+        # h ∘ (g ∘ f)
+        gf = g.compose(f)
+        h_gf = h.compose(gf)
+
+        with torch.no_grad():
+            out_left = hg_f(sample_packet).data
+            out_right = h_gf(sample_packet).data
+
+        assert torch.allclose(out_left, out_right, atol=1e-5), (
+            f"Associativity failed: max diff = {(out_left - out_right).abs().max()}"
+        )
+
+    def test_sequential_builds_correct_pipeline(self, cat, morphisms, sample_packet):
+        """CP.sequential([f, g, h]) matches manual composition."""
+        f, g, h = morphisms["f"], morphisms["g"], morphisms["h"]
+
+        pipeline = cat.sequential([f, g, h])
+        manual = h.compose(g.compose(f))
+
+        with torch.no_grad():
+            out_pipeline = pipeline(sample_packet).data
+            out_manual = manual(sample_packet).data
+
+        assert torch.allclose(out_pipeline, out_manual, atol=1e-5)
+
+    def test_cp_verify_associativity_law(self, cat, morphisms, sample_packet):
+        """CP.verify_associativity_law passes for standard layers."""
+        f, g, h = morphisms["f"], morphisms["g"], morphisms["h"]
+        result = cat.verify_associativity_law(f, g, h, sample_packet)
+        assert result, "Associativity law should hold"
+
+
+# ─────────────────────────────────────────────
+# 4. Adjunction Tests
+# ─────────────────────────────────────────────
+
+class TestAdjunction:
+    """
+    The forward-backward duality: F ⊣ B
+
+    Every forward morphism has a corresponding backward morphism
+    derived via the VJP. The adjunction formalizes this relationship.
+    """
+
+    def test_forward_functor_preserves_computation(self, morphisms, sample_packet):
+        """F(f) computes the same thing as f, but enables grad tracking."""
+        F = ForwardFunctor()
+        f = morphisms["f"]
+        Ff = F(f)
+
+        with torch.no_grad():
+            out_f = f(sample_packet).data
+            out_Ff = Ff(sample_packet).data
+
+        assert torch.allclose(out_f, out_Ff, atol=1e-6)
+
+    def test_backward_functor_reverses_types(self, morphisms):
+        """B(f): B→A has reversed domain/codomain compared to f: A→B."""
+        B = BackwardFunctor()
+        f = morphisms["f"]
+        Bf = B(f)
+
+        # B(f) should map from grad of codomain to grad of domain
+        assert "grad" in Bf.domain.tag
+        assert "grad" in Bf.codomain.tag
+
+    def test_backward_morphism_computes_gradients(self, morphisms, types):
+        """B(f) applied to output gradients returns input gradients."""
+        B = BackwardFunctor()
+        f = morphisms["f"]
+        Bf = B(f)
+
+        # Create a gradient packet of the right shape
+        grad_output = torch.randn(1, 64)  # grad w.r.t. B-type output
+        grad_packet = CognitivePacket(
+            data=grad_output,
+            type=GradientType(shape=(-1, 64), tag="grad_hidden"),
+        )
+
+        result = Bf(grad_packet)
+        # Should produce a gradient of input shape (-1, 128) → (1, 128)
+        assert result.data.shape[-1] == 128
+
+    def test_adjunction_verify(self, morphisms, types, sample_packet):
+        """Full adjunction verification runs without error."""
+        adj = Adjunction()
+        f = morphisms["f"]
+
+        grad_packet = CognitivePacket(
+            data=torch.randn(1, 64),
+            type=GradientType(shape=(-1, 64), tag="grad_hidden"),
+        )
+
+        passed, message = adj.verify_adjunction(f, sample_packet, grad_packet)
+        print(f"\n{message}")
+        assert passed
+
+    def test_unit_is_type_changing_identity(self, types, sample_packet):
+        """The unit η_A maps A → B(F(A)) and is identity on values."""
+        adj = Adjunction()
+        eta = adj.unit(types["A"])
+
+        result = eta(sample_packet)
+        assert torch.allclose(result.data, sample_packet.data, atol=1e-6)
+
+    def test_transpose_of_composition(self, morphisms, types):
+        """B(g ∘ f) should be type-consistent (domain/codomain flipped)."""
+        B = BackwardFunctor()
+        f, g = morphisms["f"], morphisms["g"]
+
+        gf = g.compose(f)
+        B_gf = B(gf)
+
+        # B(g∘f): B(C) → B(A) — types should mention "grad"
+        assert "grad" in B_gf.domain.tag
+        assert "grad" in B_gf.codomain.tag
+
+
+# ─────────────────────────────────────────────
+# 5. Provenance Tracking Tests
+# ─────────────────────────────────────────────
+
+class TestProvenance:
+    """
+    CognitivePackets track which morphisms produced them.
+    This is essential for debugging distributed gradient flow.
+    """
+
+    def test_provenance_is_recorded(self, morphisms, sample_packet):
+        """Applying a morphism adds it to the packet's provenance."""
+        f = morphisms["f"]
+        result = f(sample_packet)
+        assert "layer1" in result.provenance
+
+    def test_provenance_accumulates_through_pipeline(self, cat, morphisms, sample_packet):
+        """Sequential composition records all morphisms in order."""
+        f, g, h = morphisms["f"], morphisms["g"], morphisms["h"]
+        pipeline = cat.sequential([f, g, h])
+        result = pipeline(sample_packet)
+
+        # All three layers should appear in provenance
+        prov = " ".join(result.provenance)
+        assert "layer1" in prov
+        assert "layer2" in prov
+        assert "layer3" in prov
+
+    def test_serialization_roundtrip(self, sample_packet):
+        """CognitivePacket survives serialize → deserialize."""
+        serialized = sample_packet.serialize()
+        reconstructed = CognitivePacket.deserialize(serialized)
+
+        assert torch.allclose(reconstructed.data, sample_packet.data, atol=1e-6)
+        assert reconstructed.type.shape == sample_packet.type.shape
+
+
+# ─────────────────────────────────────────────
+# 6. Parallel Composition Tests
+# ─────────────────────────────────────────────
+
+class TestParallelComposition:
+    """
+    The monoidal product f ⊗ g applies f and g to separate data streams.
+    This is the categorical foundation for data parallelism.
+    """
+
+    def test_parallel_composition_runs(self, cat, morphisms, types):
+        """f ⊗ f can be applied to a batch split between two 'devices'."""
+        f = morphisms["f"]
+        f_parallel = cat.parallel(f, f)
+
+        # Double batch: 32 samples split between two parallel morphisms
+        big_batch = torch.randn(32, 128)
+        packet = CognitivePacket(
+            data=big_batch,
+            type=ActivationType(shape=(-1, 128), tag="input"),
+        )
+
+        result = f_parallel(packet)
+        assert result.data.shape == (32, 64)
+
+    def test_parallel_name_is_informative(self, cat, morphisms):
+        """Parallel composition produces a readable name."""
+        f = morphisms["f"]
+        f_par = cat.parallel(f, f)
+        assert "⊗" in f_par.name
